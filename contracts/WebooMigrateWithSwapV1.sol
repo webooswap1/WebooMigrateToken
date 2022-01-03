@@ -5,6 +5,7 @@ import "hardhat/console.sol";
 import "./interfaces/IERC20.sol";
 import "./interfaces/IUniswapV2Router02.sol";
 
+
 abstract contract Context {
     function _msgSender() internal view virtual returns (address) {
         return msg.sender;
@@ -177,107 +178,95 @@ library SafeMath {
     }
 }
 
-contract WebooMigrate is Context, Auth {
+interface IWebooOld {
+    function setIsFeeExempt(address holder, bool exempt) external;
+}
+ 
+contract WebooMigrateWithSwapV1 is Context, Auth {
     using SafeMath for uint256;
 
-    mapping(address => address) public tokenOwner;
-    mapping(address => address) public tokenOwnerSwap;
-    mapping(address => mapping(address => uint256)) private holderAmountSwap;
-    mapping(address => mapping(address => uint256)) private holderClaim;
-    mapping(address => uint256) public totalDeposit;
-    mapping(address => uint256) public tokenBalanceLeft;
-    mapping(address => uint256) public tokenBalanceSwapLeft;
-    mapping(address => address) public pairForSwap;
-    mapping(address => address) public addressForReceiveSwap;
+    mapping(address => uint256) private holderClaim;
+    mapping(address => uint256) private holderAmount;
+    uint256 public totalDeposit;
+    uint256 public tokenBalanceLeft;
+    address public tokenOrigin;
+    address public tokenDestination;
+    
 
     address ZERO = 0x0000000000000000000000000000000000000000;
 
     address public routerAddress;
 
-    constructor(address _routerAddress) Auth(msg.sender){
+    constructor(address _routerAddress, address _tokenOrigin, address _tokenDestination) Auth(msg.sender){
         owner = msg.sender;
         routerAddress = _routerAddress;
+        tokenOrigin = _tokenOrigin;
+        tokenDestination = _tokenDestination;
     }
 
-    /** Setting Owner Token */
-    function setTokenOwner(address _token, address _owner) external authorized {
-        tokenOwner[_token] = _owner;
-    }
+    receive() external payable {}
 
-    function setTokenOwnerSwap(address _tokenDestination, address _owner) external authorized {
-        tokenOwnerSwap[_tokenDestination] = _owner;
-    }
-
-    function setHolderAmount(address _token,address[] memory _holder,uint256[] memory _amount) external {
-        require(tokenOwner[_token]==_msgSender(),"Unauthorize");
+    function setHolderAmount(address[] memory _holder,uint256[] memory _amount) external onlyOwner {
         require(_holder.length == _amount.length,"Holder and Amount need same length");
 
         for(uint i;i<_holder.length;i++){
-            holderAmountSwap[_token][_holder[i]] = _amount[i];
-            holderClaim[_token][_holder[i]] = 0;
-            totalDeposit[_token] = totalDeposit[_token].add(_amount[i]);
+            holderAmount[_holder[i]] = _amount[i];
+            totalDeposit = totalDeposit.add(_amount[i]);
         }
     }
 
-    function setPairForSwap(address _tokenOrigin, address _tokenDestination) external {
-        require(tokenOwnerSwap[_tokenDestination]==_msgSender(),"Unauthorize");
-        pairForSwap[_tokenDestination] = _tokenOrigin;
+    function resetHolderClaim(address _holder, uint256 _amount) external onlyOwner {
+        holderClaim[_holder] = _amount;
     }
 
-    function setAddressForReceiveSwap(address _tokenDestination, address _receiverAddress) external {
-       require(tokenOwnerSwap[_tokenDestination]==_msgSender(),"Unauthorize");
-       addressForReceiveSwap[_tokenDestination] = _receiverAddress; 
+    function deposit() external onlyOwner{
+        IERC20(tokenDestination).transferFrom(_msgSender(),address(this),totalDeposit);
     }
 
-    function deposit(address _token) external {
-        require(tokenOwner[_token]==_msgSender(),"Unauthorize"); 
-        uint256 _totalDeposit = totalDeposit[_token];
-        IERC20(_token).transferFrom(_msgSender(),address(this),_totalDeposit);
-        tokenBalanceLeft[_token] = tokenBalanceLeft[_token].add(_totalDeposit);
+    function claimToken(address _holder) external {
+        require(holderAmount[_holder] > 0,"Holder amount is 0");
+        uint256 amountSend = holderAmount[_holder].sub(holderClaim[_holder]);
+        uint256 balanceBefore = IERC20(tokenOrigin).balanceOf(address(this));
+        /** 1. Update set exempt fee untuk holder */
+        IWebooOld(tokenOrigin).setIsFeeExempt(_holder,true);
+
+        /** 2. Send V1 */
+        IERC20(tokenOrigin).transferFrom(_holder, address(this), amountSend);
+        uint256 balanceAfter = IERC20(tokenOrigin).balanceOf(address(this));
+        uint256 balanceDiff = balanceAfter.sub(balanceBefore);
+
+        /** 3. Send V2 */
+        IERC20(tokenDestination).transfer(_holder,amountSend);
+        holderClaim[_holder] = holderClaim[_holder].add(amountSend);
+
+        /** 4. Swap v1 to v2 token and send to dev */
+        IUniswapV2Router02 router = IUniswapV2Router02(routerAddress);
+        IERC20(tokenOrigin).approve(routerAddress,amountSend);
+        address[] memory path = new address[](3);
+        path[0] = tokenOrigin;
+        path[1] = router.WETH();
+        path[2] = tokenDestination;
+        uint256[] memory estimate = router.getAmountsOut(balanceDiff,path);
+        router.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            balanceDiff,
+            estimate[1],
+            path,
+            address(this), // wallet owner
+            block.timestamp
+        );
     }
 
-    function depositForSwapToken(address _tokenDestination, uint256 _amount) external {
-        require(tokenOwnerSwap[_tokenDestination]==_msgSender(),"Unauthorize");
-        IERC20(_tokenDestination).transferFrom(_msgSender(), address(this), _amount);
-        tokenBalanceSwapLeft[_tokenDestination] = tokenBalanceSwapLeft[_tokenDestination].add(_amount);
+    function getHolderAmount(address _holder) external view returns(uint256) {
+        return holderAmount[_holder].sub(holderClaim[_holder]);
     }
-
-    function withdrawl(address _token) external {
-        require(tokenOwner[_token]==_msgSender(),"Unauthorize");
-        uint256 balance = tokenBalanceLeft[_token];
-        IERC20(_token).approve(_msgSender(),balance);
-        IERC20(_token).transfer(_msgSender(),balance);
-    }
-
-    function withdrawlForSwap(address _tokenDestination) external {
-        require(tokenOwnerSwap[_tokenDestination]==_msgSender(),"Unauthorize");
-        uint256 balance = tokenBalanceSwapLeft[_tokenDestination];
-        IERC20(_tokenDestination).approve(_msgSender(),balance);
-        IERC20(_tokenDestination).transfer(_msgSender(),balance);
-    }
-
-    function balanceOf(address _token) public view returns(uint256) {
-        return IERC20(_token).balanceOf(address(this));
-    }
-
-    function claimToken(address _token, address _holder) external {
-        require(holderAmountSwap[_token][_holder] > 0,"Holder amount is 0");
-
-        uint256 amountSend = holderAmountSwap[_token][_holder].sub(holderClaim[_token][_holder]);
-        
-        IERC20(_token).approve(_holder,amountSend);
-        IERC20(_token).transfer(_holder,amountSend);
-        holderClaim[_token][_holder] = holderClaim[_token][_holder].add(amountSend);
-        tokenBalanceLeft[_token] = tokenBalanceLeft[_token].sub(amountSend);
-    }
-
-    function getHolderAmount(address _token, address _holder) external view returns(uint256) {
-        return holderAmountSwap[_token][_holder].sub(holderClaim[_token][_holder]);
-    }
-
 
     function getTokenFromContract(address tokenAddress, address to, uint256 amount) external onlyOwner {
-        try IERC20(tokenAddress).approve(to, amount) {} catch {}
-        try IERC20(tokenAddress).transfer(to,amount) {} catch {}
+        IERC20(tokenAddress).transfer(to,amount);
+    }
+
+    function getETH(address to, uint256 amount) external onlyOwner{
+        if(address(this).balance >= amount){
+            payable(to).transfer(amount);
+        }
     }
 }
